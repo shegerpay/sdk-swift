@@ -1,3 +1,5 @@
+<p align="center"><img src="logo.png" alt="ShegerPay" width="200" /></p>
+
 # ShegerPay iOS Swift SDK
 
 Official Swift SDK for ShegerPay — Ethiopian payment verification.
