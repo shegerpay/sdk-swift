@@ -322,6 +322,55 @@ public final class ShegerPay: Sendable {
         let result: Response = try await get(path: "/api/v1/payment-links?limit=\(limit)&offset=\(offset)")
         return result.links
     }
+
+    // MARK: - Promo Codes
+
+    public func createPromoCode(_ params: [String: Any]) async throws -> [String: Any] {
+        try await requestDictionary(method: "POST", path: "/api/v1/promo-codes/", json: promoPayload(params))
+    }
+
+    public func listPromoCodes() async throws -> [[String: Any]] {
+        try await requestArray(method: "GET", path: "/api/v1/promo-codes/", json: nil)
+    }
+
+    public func updatePromoCode(_ codeId: String, params: [String: Any]) async throws -> [String: Any] {
+        try await requestDictionary(method: "PATCH", path: "/api/v1/promo-codes/\(codeId)", json: promoPayload(params))
+    }
+
+    public func deletePromoCode(_ codeId: String) async throws -> [String: Any] {
+        try await requestDictionary(method: "DELETE", path: "/api/v1/promo-codes/\(codeId)", json: nil)
+    }
+
+    public func validatePromoCode(code: String, amount: Double, options: [String: Any] = [:]) async throws -> [String: Any] {
+        var body = options
+        body["code"] = code
+        body["amount"] = amount
+        return try await requestDictionary(method: "POST", path: "/api/v1/promo-codes/validate", json: body)
+    }
+
+    public func redeemPromoCode(code: String, amount: Double, transactionId: String, options: [String: Any] = [:]) async throws -> [String: Any] {
+        var body = options
+        body["code"] = code
+        body["amount"] = amount
+        body["transaction_id"] = transactionId
+        return try await requestDictionary(method: "POST", path: "/api/v1/promo-codes/redeem", json: body)
+    }
+
+    public func applyPaymentLinkCoupon(shortCode: String, code: String, amount: Double? = nil, quantity: Int = 1, provider: String? = nil, customerIdentifier: String? = nil) async throws -> [String: Any] {
+        var body: [String: Any] = ["code": code, "quantity": quantity]
+        if let amount { body["amount"] = amount }
+        if let provider { body["provider"] = provider }
+        if let customerIdentifier { body["customer_identifier"] = customerIdentifier }
+        return try await requestDictionary(method: "POST", path: "/api/v1/payment-links/\(shortCode)/apply-coupon", json: body)
+    }
+
+    public func getPaymentLinkOrderStatus(shortCode: String, orderId: String) async throws -> [String: Any] {
+        return try await requestDictionary(
+            method: "GET",
+            path: "/api/v1/payment-links/\(shortCode)/orders/\(orderId)/status",
+            json: nil
+        )
+    }
     
     // MARK: - Crypto Payments
     
@@ -374,6 +423,38 @@ public final class ShegerPay: Sendable {
         return false
         #endif
     }
+
+    public static func verifyRedirectSignature(params: [String: Any], signature: String, secret: String) -> Bool {
+        #if canImport(CommonCrypto)
+        let amountValue = Double("\(params["amount"] ?? "0")") ?? 0
+        let amount = String(format: "%.2f", amountValue)
+        let payload = [
+            "\(params["checkout_session_id"] ?? params["checkoutSessionId"] ?? "")",
+            "\(params["order_id"] ?? params["orderId"] ?? "")",
+            "\(params["short_code"] ?? params["shortCode"] ?? "")",
+            amount,
+            "\(params["currency"] ?? "ETB")",
+            "\(params["status"] ?? "paid")"
+        ].joined(separator: "|")
+        guard let keyData = secret.data(using: .utf8),
+              let payloadData = payload.data(using: .utf8) else {
+            return false
+        }
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        keyData.withUnsafeBytes { keyBytes in
+            payloadData.withUnsafeBytes { dataBytes in
+                CCHmac(CCHmacAlgorithm(kCCHmacAlgSHA256),
+                       keyBytes.baseAddress, keyData.count,
+                       dataBytes.baseAddress, payloadData.count,
+                       &digest)
+            }
+        }
+        let expected = digest.map { String(format: "%02x", $0) }.joined()
+        return expected == signature.replacingOccurrences(of: "sha256=", with: "")
+        #else
+        return false
+        #endif
+    }
     
     // MARK: - Private HTTP Methods
     
@@ -393,6 +474,72 @@ public final class ShegerPay: Sendable {
         request.httpBody = try JSONSerialization.data(withJSONObject: json)
         addHeaders(to: &request)
         return try await execute(request)
+    }
+
+    private func requestDictionary(method: String, path: String, json: [String: Any]?) async throws -> [String: Any] {
+        var request = URLRequest(url: URL(string: baseURL + path)!)
+        request.httpMethod = method
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let json, method != "GET", method != "DELETE" {
+            request.httpBody = try JSONSerialization.data(withJSONObject: json)
+        }
+        addHeaders(to: &request)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ShegerPayError.invalidResponse
+        }
+        switch httpResponse.statusCode {
+        case 200...299:
+            if httpResponse.statusCode == 204 { return [:] }
+            return (try JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        case 401:
+            throw ShegerPayError.authenticationFailed
+        case 429:
+            throw ShegerPayError.rateLimitExceeded
+        default:
+            throw ShegerPayError.serverError(httpResponse.statusCode, String(data: data, encoding: .utf8) ?? "Unknown error")
+        }
+    }
+
+    private func requestArray(method: String, path: String, json: [String: Any]?) async throws -> [[String: Any]] {
+        var request = URLRequest(url: URL(string: baseURL + path)!)
+        request.httpMethod = method
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let json, method != "GET", method != "DELETE" {
+            request.httpBody = try JSONSerialization.data(withJSONObject: json)
+        }
+        addHeaders(to: &request)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ShegerPayError.invalidResponse
+        }
+        switch httpResponse.statusCode {
+        case 200...299:
+            return (try JSONSerialization.jsonObject(with: data)) as? [[String: Any]] ?? []
+        case 401:
+            throw ShegerPayError.authenticationFailed
+        case 429:
+            throw ShegerPayError.rateLimitExceeded
+        default:
+            throw ShegerPayError.serverError(httpResponse.statusCode, String(data: data, encoding: .utf8) ?? "Unknown error")
+        }
+    }
+
+    private func promoPayload(_ params: [String: Any]) -> [String: Any] {
+        Dictionary(uniqueKeysWithValues: params.map { (snakeCase($0.key), $0.value) })
+    }
+
+    private func snakeCase(_ value: String) -> String {
+        value.reduce(into: "") { output, character in
+            if character.isUppercase {
+                output.append("_")
+                output.append(character.lowercased())
+            } else {
+                output.append(character)
+            }
+        }
     }
     
     private func addHeaders(to request: inout URLRequest) {
